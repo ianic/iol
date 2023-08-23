@@ -18,10 +18,6 @@ const (
 )
 
 func main() {
-	// var programLevel = new(slog.LevelVar) // Info by default
-	// h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: programLevel})
-	// slog.SetDefault(slog.New(h))
-	// programLevel.Set(slog.LevelDebug)
 	slog.SetDefault(slog.New(
 		slog.NewTextHandler(
 			os.Stderr,
@@ -55,13 +51,20 @@ func run() error {
 
 type completionCallback = func(res int32, flags uint32, err error)
 
+// currently using only 1 provided buffer group
+const buffersGroupID = 0
+
 type Loop struct {
 	ring             *giouring.Ring
 	inKernel         uint
 	callbacks        map[uint64]completionCallback
 	callbacksCounter uint64
-	br               *giouring.BufAndRing
-	buffers          []byte
+	buffers          struct {
+		br      *giouring.BufAndRing
+		data    []byte
+		entries uint32
+		bufLen  uint32
+	}
 }
 
 func NewIO(ringSize uint32) (*Loop, error) {
@@ -69,30 +72,59 @@ func NewIO(ringSize uint32) (*Loop, error) {
 	if err != nil {
 		return nil, err
 	}
-	const entries = uint32(16)
-	const bufLen = uint32(4096)
 	l := &Loop{
 		ring:      ring,
 		callbacks: make(map[uint64]completionCallback),
-		buffers:   make([]byte, entries*bufLen),
 	}
-
-	l.br, err = ring.SetupBufRing(entries, 1, 0)
-	if err != nil {
+	//  TODO: remove constants, make reasonable defaults
+	if err := l.initBuffers(2, 4096); err != nil {
 		return nil, err
 	}
+	return l, nil
+}
+
+func (l *Loop) initBuffers(entries uint32, bufLen uint32) error {
+	l.buffers.data = make([]byte, entries*bufLen)
+	var err error
+	l.buffers.br, err = l.ring.SetupBufRing(entries, buffersGroupID, 0)
+	if err != nil {
+		return err
+	}
 	for i := uint32(0); i < entries; i++ {
-		l.br.BufRingAdd(
-			uintptr(unsafe.Pointer(&l.buffers[bufLen*i])),
+		l.buffers.br.BufRingAdd(
+			uintptr(unsafe.Pointer(&l.buffers.data[bufLen*i])),
 			bufLen,
 			uint16(i),
 			giouring.BufRingMask(entries),
 			int(i),
 		)
 	}
-	l.br.BufRingAdvance(int(entries))
+	l.buffers.br.BufRingAdvance(int(entries))
+	return nil
+}
 
-	return l, nil
+// get provided buffer from cqe res, flags
+func (l *Loop) getBuffer(res int32, flags uint32) ([]byte, uint16) {
+	isProvidedBuffer := flags&giouring.CQEFBuffer > 0
+	if !isProvidedBuffer {
+		panic("missing buffer flag")
+	}
+	bufferID := uint16(flags >> giouring.CQEBufferShift)
+	start := uint32(bufferID) * l.buffers.bufLen
+	n := uint32(res)
+	return l.buffers.data[start : start+n], bufferID
+}
+
+// return provided buffer to the kernel
+func (l *Loop) releaseBuffer(buf []byte, bufferID uint16) {
+	l.buffers.br.BufRingAdd(
+		uintptr(unsafe.Pointer(&buf[0])),
+		l.buffers.bufLen,
+		uint16(bufferID),
+		giouring.BufRingMask(l.buffers.entries),
+		0,
+	)
+	l.buffers.br.BufRingAdvance(1)
 }
 
 func (l *Loop) tick() error {
@@ -178,14 +210,15 @@ func (l *Loop) PrepareSend(fd int, buf []byte, cb completionCallback) error {
 }
 
 // Multishot, provided buffers recv
-func (l *Loop) PrepareRecv(fd int, cb completionCallback) error {
+func (l *Loop) PrepareRecv(fd int,
+	cb completionCallback) error {
 	sqe, err := l.getSQE()
 	if err != nil {
 		return err
 	}
 	sqe.PrepareRecvMultishot(fd, 0, 0, 0)
 	sqe.Flags = giouring.SqeBufferSelect
-	sqe.BufIG = 1 // l.br.Bid
+	sqe.BufIG = buffersGroupID
 	l.setCallback(sqe, cb)
 	return nil
 }
@@ -285,30 +318,12 @@ func (s *Socket) read(onRead func([]byte, error)) error {
 			onRead(nil, io.EOF)
 			return
 		}
-		isProvidedBuffer := flags&giouring.CQEFBuffer > 0
-		if !isProvidedBuffer {
-			panic("missing buffer flag")
-		}
-		bufferID := flags >> giouring.CQEBufferShift
-		start := bufferID * 4096
-		n := uint32(res)
-		buf := s.loop.buffers[start : start+n]
+		buf, id := s.loop.getBuffer(res, flags)
+		slog.Debug("onRead", "bufferID", id, "len", len(buf))
 		onRead(buf, nil)
-		s.loop.br.BufRingAdd(
-			uintptr(unsafe.Pointer(&buf[0])),
-			4096,
-			uint16(bufferID),
-			giouring.BufRingMask(16),
-			0,
-		)
-		s.loop.br.BufRingAdvance(1)
-		slog.Debug("onRead", "bufferID", bufferID, "len", n)
+		s.loop.releaseBuffer(buf, id)
 	})
 	return nil
-}
-
-func (s *Socket) onWrite(noBytes int32, err error) {
-	slog.Info("onWrite", "noBytes", noBytes, "err", err)
 }
 
 func bind(addr *syscall.SockaddrInet4) (int, error) {
