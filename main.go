@@ -1,9 +1,10 @@
 package main
 
 import (
-	"fmt"
+	"io"
 	"log"
 	"log/slog"
+	"os"
 	"syscall"
 	"unsafe"
 
@@ -17,13 +18,25 @@ const (
 )
 
 func main() {
-	if err := run2(); err != nil {
+	// var programLevel = new(slog.LevelVar) // Info by default
+	// h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: programLevel})
+	// slog.SetDefault(slog.New(h))
+	// programLevel.Set(slog.LevelDebug)
+	slog.SetDefault(slog.New(
+		slog.NewTextHandler(
+			os.Stderr,
+			&slog.HandlerOptions{
+				Level:     slog.LevelDebug,
+				AddSource: true,
+			})))
+
+	if err := run(); err != nil {
 		log.Panic(err)
 	}
 
 }
 
-func run2() error {
+func run() error {
 	io, err := NewIO(ringSize)
 	if err != nil {
 		return err
@@ -40,47 +53,71 @@ func run2() error {
 	return nil
 }
 
-type IO struct {
+type completionCallback = func(res int32, flags uint32, err error)
+
+type Loop struct {
 	ring             *giouring.Ring
 	inKernel         uint
 	callbacks        map[uint64]completionCallback
 	callbacksCounter uint64
+	br               *giouring.BufAndRing
+	buffers          []byte
 }
 
-func NewIO(ringSize uint32) (*IO, error) {
+func NewIO(ringSize uint32) (*Loop, error) {
 	ring, err := giouring.CreateRing(ringSize)
 	if err != nil {
 		return nil, err
 	}
-	return &IO{
+	const entries = uint32(16)
+	const bufLen = uint32(4096)
+	l := &Loop{
 		ring:      ring,
 		callbacks: make(map[uint64]completionCallback),
-	}, nil
+		buffers:   make([]byte, entries*bufLen),
+	}
+
+	l.br, err = ring.SetupBufRing(entries, 1, 0)
+	if err != nil {
+		return nil, err
+	}
+	for i := uint32(0); i < entries; i++ {
+		l.br.BufRingAdd(
+			uintptr(unsafe.Pointer(&l.buffers[bufLen*i])),
+			bufLen,
+			uint16(i),
+			giouring.BufRingMask(entries),
+			int(i),
+		)
+	}
+	l.br.BufRingAdvance(int(entries))
+
+	return l, nil
 }
 
-func (io *IO) tick() error {
-	submitted, err := io.ring.SubmitAndWait(1)
+func (l *Loop) tick() error {
+	submitted, err := l.ring.SubmitAndWait(1)
 	if err != nil {
 		return err
 	}
-	io.inKernel += submitted
-	_ = io.flushCompletions()
+	l.inKernel += submitted
+	_ = l.flushCompletions()
 	return nil
 }
 
-func (io *IO) flushCompletions() uint32 {
+func (l *Loop) flushCompletions() uint32 {
 	var cqes [batchSize]*giouring.CompletionQueueEvent
 	var noCompleted uint32 = 0
 	for {
-		peeked := io.ring.PeekBatchCQE(cqes[:])
-		io.inKernel -= uint(peeked)
+		peeked := l.ring.PeekBatchCQE(cqes[:])
+		l.inKernel -= uint(peeked)
 		for _, cqe := range cqes[:peeked] {
 			if cqe.UserData == 0 {
 				continue
 			}
-			io.getCallback(cqe)(cqe.Res, cqe.Flags, cqeErr(cqe))
+			l.getCallback(cqe)(cqe.Res, cqe.Flags, cqeErr(cqe))
 		}
-		io.ring.CQAdvance(peeked)
+		l.ring.CQAdvance(peeked)
 		noCompleted += peeked
 		if peeked < uint32(len(cqes)) {
 			return noCompleted
@@ -88,11 +125,11 @@ func (io *IO) flushCompletions() uint32 {
 	}
 }
 
-func (io *IO) getSQE() (*giouring.SubmissionQueueEntry, error) {
+func (l *Loop) getSQE() (*giouring.SubmissionQueueEntry, error) {
 	for {
-		sqe := io.ring.GetSQE()
+		sqe := l.ring.GetSQE()
 		if sqe == nil {
-			if err := io.tick(); err != nil {
+			if err := l.tick(); err != nil {
 				return nil, err
 			}
 			continue
@@ -101,53 +138,66 @@ func (io *IO) getSQE() (*giouring.SubmissionQueueEntry, error) {
 	}
 }
 
-func (io *IO) setCallback(sqe *giouring.SubmissionQueueEntry, cb completionCallback) {
-	io.callbacksCounter++
-	io.callbacks[io.callbacksCounter] = cb
-	sqe.UserData = io.callbacksCounter
+func (l *Loop) setCallback(sqe *giouring.SubmissionQueueEntry, cb completionCallback) {
+	l.callbacksCounter++
+	l.callbacks[l.callbacksCounter] = cb
+	sqe.UserData = l.callbacksCounter
 }
 
-func (io *IO) getCallback(cqe *giouring.CompletionQueueEvent) completionCallback {
-	cb := io.callbacks[cqe.UserData]
+func (l *Loop) getCallback(cqe *giouring.CompletionQueueEvent) completionCallback {
+	cb := l.callbacks[cqe.UserData]
 	isMultishot := (cqe.Flags & giouring.CQEFMore) > 0
 	if !isMultishot {
-		delete(io.callbacks, cqe.UserData)
+		delete(l.callbacks, cqe.UserData)
 	}
 	return cb
 }
 
-func (io *IO) Close() {
-	io.ring.QueueExit()
+func (l *Loop) Close() {
+	l.ring.QueueExit()
 }
 
-func (io *IO) PrepareMultishotAccept(fd int, cb completionCallback) error {
-	sqe, err := io.getSQE()
+func (l *Loop) PrepareMultishotAccept(fd int, cb completionCallback) error {
+	sqe, err := l.getSQE()
 	if err != nil {
 		return err
 	}
 	sqe.PrepareMultishotAccept(fd, 0, 0, 0)
-	io.setCallback(sqe, cb)
+	l.setCallback(sqe, cb)
 	return nil
 }
 
-func (io *IO) PrepareSend(fd int, buf []byte, cb completionCallback) error {
-	sqe, err := io.getSQE()
+func (l *Loop) PrepareSend(fd int, buf []byte, cb completionCallback) error {
+	sqe, err := l.getSQE()
 	if err != nil {
 		return err
 	}
 	sqe.PrepareSend(fd, uintptr(unsafe.Pointer(&buf[0])), uint32(len(buf)), 0)
-	io.setCallback(sqe, cb)
+	l.setCallback(sqe, cb)
+	return nil
+}
+
+// Multishot, provided buffers recv
+func (l *Loop) PrepareRecv(fd int, cb completionCallback) error {
+	sqe, err := l.getSQE()
+	if err != nil {
+		return err
+	}
+	sqe.PrepareRecvMultishot(fd, 0, 0, 0)
+	sqe.Flags = giouring.SqeBufferSelect
+	sqe.BufIG = 1 // l.br.Bid
+	l.setCallback(sqe, cb)
 	return nil
 }
 
 type Listener struct {
-	io *IO
-	fd int
-	s  Socket
+	loop *Loop
+	fd   int
+	s    Socket
 }
 
-func NewListener(io *IO, port int) (*Listener, error) {
-	l := &Listener{io: io}
+func NewListener(loop *Loop, port int) (*Listener, error) {
+	l := &Listener{loop: loop}
 	if err := l.bind(port); err != nil {
 		return nil, err
 	}
@@ -172,7 +222,7 @@ func (l *Listener) bind(port int) error {
 }
 
 func (l *Listener) accept() error {
-	return l.io.PrepareMultishotAccept(l.fd, func(res int32, flags uint32, err error) {
+	return l.loop.PrepareMultishotAccept(l.fd, func(res int32, flags uint32, err error) {
 		if err == nil {
 			l.onAccept(int(res))
 		}
@@ -182,18 +232,23 @@ func (l *Listener) accept() error {
 func (l *Listener) onAccept(fd int) {
 	slog.Info("listener accept", "fd", fd)
 	l.s = Socket{
-		io: l.io,
-		fd: fd,
+		loop: l.loop,
+		fd:   fd,
 	}
 	l.s.write([]byte("iso medo u ducan\n"), func(n int, err error) {
 		slog.Info("write", "bytes", n, "err", err)
 		syscall.Close(fd)
 	})
+	if err := l.s.read(func(data []byte, err error) {
+		slog.Info("read", "data", data, "err", err)
+	}); err != nil {
+		slog.Error("prepare read", "err", err)
+	}
 }
 
 type Socket struct {
-	io *IO
-	fd int
+	loop *Loop
+	fd   int
 }
 
 // Prepares Send. Ensures that whole buffer is sent. Write could be partial only
@@ -212,68 +267,48 @@ func (s *Socket) write(buf []byte, onWrite func(int, error)) error {
 			onWrite(nn, nil)
 			return
 		}
-		if err := s.io.PrepareSend(s.fd, buf[nn:], cb); err != nil {
+		if err := s.loop.PrepareSend(s.fd, buf[nn:], cb); err != nil {
 			onWrite(nn, err)
 		}
 		// new send prepared
 	}
-	return s.io.PrepareSend(s.fd, buf, cb)
+	return s.loop.PrepareSend(s.fd, buf, cb)
+}
+
+func (s *Socket) read(onRead func([]byte, error)) error {
+	s.loop.PrepareRecv(s.fd, func(res int32, flags uint32, err error) {
+		if err != nil {
+			onRead(nil, err)
+			return
+		}
+		if res == 0 {
+			onRead(nil, io.EOF)
+			return
+		}
+		isProvidedBuffer := flags&giouring.CQEFBuffer > 0
+		if !isProvidedBuffer {
+			panic("missing buffer flag")
+		}
+		bufferID := flags >> giouring.CQEBufferShift
+		start := bufferID * 4096
+		n := uint32(res)
+		buf := s.loop.buffers[start : start+n]
+		onRead(buf, nil)
+		s.loop.br.BufRingAdd(
+			uintptr(unsafe.Pointer(&buf[0])),
+			4096,
+			uint16(bufferID),
+			giouring.BufRingMask(16),
+			0,
+		)
+		s.loop.br.BufRingAdvance(1)
+		slog.Debug("onRead", "bufferID", bufferID, "len", n)
+	})
+	return nil
 }
 
 func (s *Socket) onWrite(noBytes int32, err error) {
 	slog.Info("onWrite", "noBytes", noBytes, "err", err)
-}
-
-type completionCallback = func(res int32, flags uint32, err error)
-
-func run() error {
-	ring, err := giouring.CreateRing(ringSize)
-	if err != nil {
-		return err
-	}
-	defer ring.QueueExit()
-
-	cqeBuff := make([]*giouring.CompletionQueueEvent, batchSize)
-
-	addr := syscall.SockaddrInet4{Port: 4242}
-	fd, err := bind(&addr)
-	if err != nil {
-		return err
-	}
-	defer syscall.Close(fd)
-
-	slog.Info("bind", "fd", fd)
-
-	//for {
-	entry := ring.GetSQE()
-	if entry == nil {
-		log.Panic()
-	}
-
-	entry.PrepareMultishotAccept(fd, 0, 0, 0)
-	entry.UserData = 0xdead_beef
-
-	submitted, err := ring.SubmitAndWait(1)
-	if err != nil {
-		log.Panic(err)
-	}
-	slog.Info("zavrsio accept", "submitted", submitted)
-
-	peeked := ring.PeekBatchCQE(cqeBuff)
-	cqe := cqeBuff[0]
-	cqe.GetData()
-	fmt.Printf("cqe %d %d %x %v", cqe.Flags, cqe.Res, cqe.UserData, cqeErr(cqe))
-	ring.CQAdvance(uint32(peeked))
-
-	//}
-	return nil
-}
-
-func cqeErr(c *giouring.CompletionQueueEvent) error {
-	if c.Res > -4096 && c.Res < 0 {
-		return syscall.Errno(-c.Res)
-	}
-	return nil
 }
 
 func bind(addr *syscall.SockaddrInet4) (int, error) {
@@ -297,4 +332,11 @@ func bind(addr *syscall.SockaddrInet4) (int, error) {
 		return 0, err
 	}
 	return fd, nil
+}
+
+func cqeErr(c *giouring.CompletionQueueEvent) error {
+	if c.Res > -4096 && c.Res < 0 {
+		return syscall.Errno(-c.Res)
+	}
+	return nil
 }
