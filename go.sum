@@ -1,4 +1,6 @@
 github.com/pawelgaczynski/giouring v0.0.0-20230821111130-24e7a29bc73d h1:CaZCc5foiAb/ggU5WRNBBGmHiNVI6i/YHEe6CQnMTws=
 github.com/pawelgaczynski/giouring v0.0.0-20230821111130-24e7a29bc73d/go.mod h1:HwOQqYv/WE3RMp4iTQsS6ou8WP3wKO9UXD0oDqB3NPU=
+golang.org/dl v0.0.0-20230818220345-55c644201171 h1:qD2wbnERqr3JNcREP1VkbdMjwCq+eQs7mquLG1T2Y0U=
+golang.org/dl v0.0.0-20230818220345-55c644201171/go.mod h1:IUMfjQLJQd4UTqG1Z90tenwKoCX93Gn3MAQJMOSBsDQ=
 golang.org/x/sys v0.10.0 h1:SqMFp9UcQJZa+pmYuAKjd9xq1f0j5rLcDIk0mj4qAsA=
 golang.org/x/sys v0.10.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=

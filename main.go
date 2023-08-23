@@ -41,8 +41,10 @@ func run2() error {
 }
 
 type IO struct {
-	ring     *giouring.Ring
-	inKernel uint
+	ring             *giouring.Ring
+	inKernel         uint
+	callbacks        map[uint64]completionCallback
+	callbacksCounter uint64
 }
 
 func NewIO(ringSize uint32) (*IO, error) {
@@ -51,7 +53,8 @@ func NewIO(ringSize uint32) (*IO, error) {
 		return nil, err
 	}
 	return &IO{
-		ring: ring,
+		ring:      ring,
+		callbacks: make(map[uint64]completionCallback),
 	}, nil
 }
 
@@ -75,9 +78,7 @@ func (io *IO) flushCompletions() uint32 {
 			if cqe.UserData == 0 {
 				continue
 			}
-			err := cqeErr(cqe)
-			cb := (*completionCallback)(cqe.GetData())
-			(*cb)(cqe.Res, cqe.Flags, err)
+			io.getCallback(cqe)(cqe.Res, cqe.Flags, cqeErr(cqe))
 		}
 		io.ring.CQAdvance(peeked)
 		noCompleted += peeked
@@ -94,26 +95,59 @@ func (io *IO) getSQE() (*giouring.SubmissionQueueEntry, error) {
 			if err := io.tick(); err != nil {
 				return nil, err
 			}
-			panic("nema")
 			continue
 		}
 		return sqe, nil
 	}
 }
 
+func (io *IO) setCallback(sqe *giouring.SubmissionQueueEntry, cb completionCallback) {
+	io.callbacksCounter++
+	io.callbacks[io.callbacksCounter] = cb
+	sqe.UserData = io.callbacksCounter
+}
+
+func (io *IO) getCallback(cqe *giouring.CompletionQueueEvent) completionCallback {
+	cb := io.callbacks[cqe.UserData]
+	isMultishot := (cqe.Flags & giouring.CQEFMore) > 0
+	if !isMultishot {
+		delete(io.callbacks, cqe.UserData)
+	}
+	return cb
+}
+
 func (io *IO) Close() {
 	io.ring.QueueExit()
+}
+
+func (io *IO) PrepareMultishotAccept(fd int, cb completionCallback) error {
+	sqe, err := io.getSQE()
+	if err != nil {
+		return err
+	}
+	sqe.PrepareMultishotAccept(fd, 0, 0, 0)
+	io.setCallback(sqe, cb)
+	return nil
+}
+
+func (io *IO) PrepareSend(fd int, buf []byte, cb completionCallback) error {
+	sqe, err := io.getSQE()
+	if err != nil {
+		return err
+	}
+	sqe.PrepareSend(fd, uintptr(unsafe.Pointer(&buf[0])), uint32(len(buf)), 0)
+	io.setCallback(sqe, cb)
+	return nil
 }
 
 type Listener struct {
 	io *IO
 	fd int
-	cb completionCallback
 	s  Socket
 }
 
 func NewListener(io *IO, port int) (*Listener, error) {
-	l := Listener{io: io}
+	l := &Listener{io: io}
 	if err := l.bind(port); err != nil {
 		return nil, err
 	}
@@ -121,7 +155,7 @@ func NewListener(io *IO, port int) (*Listener, error) {
 		_ = l.Close()
 		return nil, err
 	}
-	return &l, nil
+	return l, nil
 }
 func (l *Listener) Close() error {
 	return syscall.Close(l.fd)
@@ -138,22 +172,11 @@ func (l *Listener) bind(port int) error {
 }
 
 func (l *Listener) accept() error {
-	sqe, err := l.io.getSQE()
-	if err != nil {
-		return err
-	}
-	l.cb = func(res int32, flags uint32, err error) {
+	return l.io.PrepareMultishotAccept(l.fd, func(res int32, flags uint32, err error) {
 		if err == nil {
 			l.onAccept(int(res))
 		}
-	}
-	sqe.PrepareMultishotAccept(l.fd, 0, 0, 0)
-	sqe.UserData = uint64(uintptr(unsafe.Pointer(&l.cb)))
-	return nil
-}
-
-func (l *Listener) onAccept2(res int32, flags uint32, err error) {
-	slog.Info("listener onAccept2", "fd", res)
+	})
 }
 
 func (l *Listener) onAccept(fd int) {
@@ -162,32 +185,39 @@ func (l *Listener) onAccept(fd int) {
 		io: l.io,
 		fd: fd,
 	}
-	l.s.write(data)
-	//syscall.Close(fd)
+	l.s.write([]byte("iso medo u ducan\n"), func(n int, err error) {
+		slog.Info("write", "bytes", n, "err", err)
+		syscall.Close(fd)
+	})
 }
-
-var data = []byte("iso medo u ducan")
 
 type Socket struct {
 	io *IO
 	fd int
-
-	cb completionCallback
 }
 
-func (s *Socket) write(buf []byte) error {
-	sqe, err := s.io.getSQE()
-	if err != nil {
-		return err
-	}
-	s.cb = func(res int32, flags uint32, err error) {
-		if err == nil {
-			s.onWrite(res, err)
+// Prepares Send. Ensures that whole buffer is sent. Write could be partial only
+// in case of error. In that case it returns number of bytes written and error.
+// When error is nil, number of bytes written is len(buf).
+func (s *Socket) write(buf []byte, onWrite func(int, error)) error {
+	nn := 0
+	var cb completionCallback
+	cb = func(res int32, flags uint32, err error) {
+		nn += int(res) // bytes written
+		if err != nil {
+			onWrite(nn, err)
+			return
 		}
+		if nn >= len(buf) {
+			onWrite(nn, nil)
+			return
+		}
+		if err := s.io.PrepareSend(s.fd, buf[nn:], cb); err != nil {
+			onWrite(nn, err)
+		}
+		// new send prepared
 	}
-	sqe.PrepareSend(s.fd, uintptr(unsafe.Pointer(&buf[0])), uint32(len(buf)), 0)
-	sqe.UserData = uint64(uintptr(unsafe.Pointer(&s.cb)))
-	return nil
+	return s.io.PrepareSend(s.fd, buf, cb)
 }
 
 func (s *Socket) onWrite(noBytes int32, err error) {
