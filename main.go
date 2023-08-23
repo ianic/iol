@@ -59,12 +59,58 @@ type Loop struct {
 	inKernel         uint
 	callbacks        map[uint64]completionCallback
 	callbacksCounter uint64
-	buffers          struct {
-		br      *giouring.BufAndRing
-		data    []byte
-		entries uint32
-		bufLen  uint32
+	buffers          providedBuffers
+}
+
+type providedBuffers struct {
+	br      *giouring.BufAndRing
+	data    []byte
+	entries uint32
+	bufLen  uint32
+}
+
+func (b *providedBuffers) init(ring *giouring.Ring, entries uint32, bufLen uint32) error {
+	b.data = make([]byte, entries*bufLen)
+	var err error
+	b.br, err = ring.SetupBufRing(entries, buffersGroupID, 0)
+	if err != nil {
+		return err
 	}
+	for i := uint32(0); i < entries; i++ {
+		b.br.BufRingAdd(
+			uintptr(unsafe.Pointer(&b.data[bufLen*i])),
+			bufLen,
+			uint16(i),
+			giouring.BufRingMask(entries),
+			int(i),
+		)
+	}
+	b.br.BufRingAdvance(int(entries))
+	return nil
+}
+
+// get provided buffer from cqe res, flags
+func (b *providedBuffers) get(res int32, flags uint32) ([]byte, uint16) {
+	isProvidedBuffer := flags&giouring.CQEFBuffer > 0
+	if !isProvidedBuffer {
+		panic("missing buffer flag")
+	}
+	bufferID := uint16(flags >> giouring.CQEBufferShift)
+	start := uint32(bufferID) * b.bufLen
+	n := uint32(res)
+	return b.data[start : start+n], bufferID
+}
+
+// return provided buffer to the kernel
+func (b *providedBuffers) release(buf []byte, bufferID uint16) {
+	b.br.BufRingAdd(
+		uintptr(unsafe.Pointer(&buf[0])),
+		b.bufLen,
+		uint16(bufferID),
+		giouring.BufRingMask(b.entries),
+		0,
+	)
+	b.br.BufRingAdvance(1)
 }
 
 func NewIO(ringSize uint32) (*Loop, error) {
@@ -77,54 +123,10 @@ func NewIO(ringSize uint32) (*Loop, error) {
 		callbacks: make(map[uint64]completionCallback),
 	}
 	//  TODO: remove constants, make reasonable defaults
-	if err := l.initBuffers(2, 4096); err != nil {
+	if err := l.buffers.init(ring, 2, 4096); err != nil {
 		return nil, err
 	}
 	return l, nil
-}
-
-func (l *Loop) initBuffers(entries uint32, bufLen uint32) error {
-	l.buffers.data = make([]byte, entries*bufLen)
-	var err error
-	l.buffers.br, err = l.ring.SetupBufRing(entries, buffersGroupID, 0)
-	if err != nil {
-		return err
-	}
-	for i := uint32(0); i < entries; i++ {
-		l.buffers.br.BufRingAdd(
-			uintptr(unsafe.Pointer(&l.buffers.data[bufLen*i])),
-			bufLen,
-			uint16(i),
-			giouring.BufRingMask(entries),
-			int(i),
-		)
-	}
-	l.buffers.br.BufRingAdvance(int(entries))
-	return nil
-}
-
-// get provided buffer from cqe res, flags
-func (l *Loop) getBuffer(res int32, flags uint32) ([]byte, uint16) {
-	isProvidedBuffer := flags&giouring.CQEFBuffer > 0
-	if !isProvidedBuffer {
-		panic("missing buffer flag")
-	}
-	bufferID := uint16(flags >> giouring.CQEBufferShift)
-	start := uint32(bufferID) * l.buffers.bufLen
-	n := uint32(res)
-	return l.buffers.data[start : start+n], bufferID
-}
-
-// return provided buffer to the kernel
-func (l *Loop) releaseBuffer(buf []byte, bufferID uint16) {
-	l.buffers.br.BufRingAdd(
-		uintptr(unsafe.Pointer(&buf[0])),
-		l.buffers.bufLen,
-		uint16(bufferID),
-		giouring.BufRingMask(l.buffers.entries),
-		0,
-	)
-	l.buffers.br.BufRingAdvance(1)
 }
 
 func (l *Loop) tick() error {
@@ -318,10 +320,10 @@ func (s *Socket) read(onRead func([]byte, error)) error {
 			onRead(nil, io.EOF)
 			return
 		}
-		buf, id := s.loop.getBuffer(res, flags)
+		buf, id := s.loop.buffers.get(res, flags)
 		slog.Debug("onRead", "bufferID", id, "len", len(buf))
 		onRead(buf, nil)
-		s.loop.releaseBuffer(buf, id)
+		s.loop.buffers.release(buf, id)
 	})
 	return nil
 }
