@@ -1,4 +1,4 @@
-module echo
+module loop
 
 go 1.21.0
 
