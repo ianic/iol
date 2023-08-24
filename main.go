@@ -33,7 +33,7 @@ func main() {
 }
 
 func run() error {
-	io, err := NewIO(ringSize)
+	io, err := NewLoop(ringSize)
 	if err != nil {
 		return err
 	}
@@ -113,7 +113,7 @@ func (b *providedBuffers) release(buf []byte, bufferID uint16) {
 	b.br.BufRingAdvance(1)
 }
 
-func NewIO(ringSize uint32) (*Loop, error) {
+func NewLoop(ringSize uint32) (*Loop, error) {
 	ring, err := giouring.CreateRing(ringSize)
 	if err != nil {
 		return nil, err
