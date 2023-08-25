@@ -1,4 +1,4 @@
-module loop
+module github.com/ianic/iol
 
 go 1.21.0
 

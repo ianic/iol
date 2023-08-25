@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"log/slog"
-	"loop"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/ianic/iol"
 )
 
 func main() {
@@ -26,13 +27,17 @@ func main() {
 
 func run(port int) error {
 	slog.Debug("starting server", "port", port)
-	lp, err := loop.New(loop.DefaultOptions)
+	lp, err := iol.New(iol.Options{
+		RingEntries:      128,
+		RecvBuffersCount: 256,
+		RecvBufferLen:    1024,
+	})
 	if err != nil {
 		return err
 	}
 	defer lp.Close()
 	srv := server{}
-	ln, err := loop.NewListener(lp, port, &srv)
+	ln, err := iol.NewListener(lp, port, &srv)
 	if err != nil {
 		return err
 	}
@@ -67,10 +72,10 @@ func interuptContext() context.Context {
 }
 
 type server struct {
-	sender loop.Sender
+	sender iol.Sender
 }
 
-func (s *server) OnStart(writer loop.Sender) {
+func (s *server) OnStart(writer iol.Sender) {
 	s.sender = writer
 }
 
@@ -83,7 +88,7 @@ func (s *server) OnDisconnect(fd int, err error) {
 }
 
 func (s *server) OnRecv(fd int, data []byte) {
-	slog.Debug("received", "fd", fd, "data", data)
+	slog.Debug("received", "fd", fd, "len", len(data))
 
 	dst := make([]byte, len(data))
 	copy(dst, data)

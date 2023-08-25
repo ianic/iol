@@ -1,4 +1,4 @@
-package loop
+package iol
 
 import (
 	"log/slog"
@@ -45,6 +45,10 @@ func NewListener(loop *Loop, port int, srv Server) (*Listener, error) {
 }
 
 func (l *Listener) Send(fd int, data []byte) error {
+	if _, ok := l.conns[fd]; !ok {
+		l.srv.OnSend(fd, syscall.ENOTCONN)
+		return nil
+	}
 	nn := 0
 	var cb completionCallback
 	cb = func(res int32, flags uint32, errno syscall.Errno) {
@@ -82,8 +86,12 @@ func (l *Listener) bind(port int) error {
 func (l *Listener) accept() error {
 	return l.loop.PrepareMultishotAccept(l.fd, func(res int32, flags uint32, errno syscall.Errno) {
 		if errno == 0 {
-			l.onAccept(int(res))
-		} else {
+			fd := int(res)
+			l.srv.OnConnect(fd)
+			l.recvLoop(fd)
+			return
+		}
+		if errno != syscall.ECANCELED {
 			slog.Debug("accept", "errno", errno, "res", res, "flags", flags)
 		}
 	})
@@ -98,17 +106,9 @@ func (l *Listener) Close() error {
 	return l.loop.PrepareCancelFd(l.fd, func(res int32, flags uint32, errno syscall.Errno) {
 		slog.Debug("listener close", "errno", errno, "res", res, "flags", flags)
 		for fd := range l.conns {
-			l.loop.PrepareShutdown(fd, func(res int32, flags uint32, errno syscall.Errno) {
-				slog.Debug("shutdown", "fd", fd, "errno", errno, "res", res, "flags", flags)
-				delete(l.conns, fd)
-			})
+			l.shutdown(fd, nil)
 		}
 	})
-}
-
-func (l *Listener) onAccept(fd int) {
-	l.srv.OnConnect(fd)
-	l.recvLoop(fd)
 }
 
 // recvLoop starts multishot recv on fd
@@ -119,25 +119,49 @@ func (l *Listener) recvLoop(fd int) error {
 	var cb completionCallback
 	cb = func(res int32, flags uint32, errno syscall.Errno) {
 		if errno > 0 {
-			if errno == syscall.ENOBUFS || errno.Temporary() {
+			if TemporaryErrno(errno) {
 				slog.Debug("read temporary error", "error", errno.Error(), "errno", uint(errno), "flags", flags)
 				l.loop.PrepareRecv(fd, cb)
 				return
 			}
-			slog.Warn("read error", "error", errno.Error(), "errno", uint(errno), "flags", flags)
-			l.srv.OnDisconnect(fd, errno)
+			if errno != syscall.ECONNRESET {
+				slog.Warn("read error", "error", errno.Error(), "errno", uint(errno), "flags", flags)
+			}
+			l.shutdown(fd, errno)
 			return
 		}
 		if res == 0 {
-			l.srv.OnDisconnect(fd, nil)
+			l.shutdown(fd, nil)
 			return
 		}
 		buf, id := l.loop.buffers.get(res, flags)
-		slog.Debug("read", "bufferID", id, "len", len(buf))
+		//slog.Debug("read", "bufferID", id, "len", len(buf))
 		l.srv.OnRecv(fd, buf)
 		l.loop.buffers.release(buf, id)
 	}
 	return l.loop.PrepareRecv(fd, cb)
+}
+
+func (l *Listener) shutdown(fd int, err error) {
+	if _, ok := l.conns[fd]; ok {
+		l.srv.OnDisconnect(fd, err)
+		delete(l.conns, fd)
+
+		l.loop.PrepareShutdown(fd, func(res int32, flags uint32, errno syscall.Errno) {
+			if !(errno == 0 || errno == syscall.ENOTCONN) {
+				slog.Debug("shutdown", "fd", fd, "errno", errno, "res", res, "flags", flags)
+			}
+
+			if errno != 0 {
+				return
+			}
+			l.loop.PrepareClose(fd, func(res int32, flags uint32, errno syscall.Errno) {
+				if errno != 0 {
+					slog.Debug("close", "fd", fd, "errno", errno, "res", res, "flags", flags)
+				}
+			})
+		})
+	}
 }
 
 func bind(addr *syscall.SockaddrInet4) (int, error) {

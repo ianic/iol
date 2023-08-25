@@ -1,4 +1,4 @@
-package loop
+package iol
 
 import (
 	"context"
@@ -14,8 +14,7 @@ import (
 )
 
 const (
-	ringSize       = 32
-	batchSize      = 32
+	batchSize      = 128
 	buffersGroupID = 0 // currently using only 1 provided buffer group
 )
 
@@ -88,7 +87,7 @@ func (l *Loop) Run(ctx context.Context, timeout time.Duration) error {
 		if err := l.submitAndWait(0); err != nil {
 			return err
 		}
-		if _, err := l.ring.WaitCQEs(1, &ts, nil); err != nil && !Temporary(err) {
+		if _, err := l.ring.WaitCQEs(1, &ts, nil); err != nil && !TemporaryErr(err) {
 			return err
 		}
 		_ = l.flushCompletions()
@@ -100,11 +99,9 @@ func (l *Loop) Run(ctx context.Context, timeout time.Duration) error {
 }
 
 // is this error temporary
-func Temporary(err error) bool {
+func TemporaryErr(err error) bool {
 	if errno, ok := err.(syscall.Errno); ok {
-		if errno.Temporary() || errno == unix.ETIME {
-			return true
-		}
+		return TemporaryErrno(errno)
 	}
 	if os.IsTimeout(err) {
 		return true
@@ -112,11 +109,15 @@ func Temporary(err error) bool {
 	return false
 }
 
+func TemporaryErrno(errno syscall.Errno) bool {
+	return errno.Temporary() || errno == unix.ETIME || errno == syscall.ENOBUFS
+}
+
 // retry on temporary errors
 func (l *Loop) submitAndWait(waitNr int) error {
 	for {
 		_, err := l.ring.SubmitAndWait(0)
-		if err != nil && Temporary(err) {
+		if err != nil && TemporaryErr(err) {
 			continue
 		}
 		return err
@@ -190,6 +191,16 @@ func (l *Loop) PrepareShutdown(fd int, cb completionCallback) error {
 	}
 	const SHUT_RDWR = 2
 	sqe.PrepareShutdown(fd, SHUT_RDWR)
+	l.callbacks.set(sqe, cb)
+	return nil
+}
+
+func (l *Loop) PrepareClose(fd int, cb completionCallback) error {
+	sqe, err := l.getSQE()
+	if err != nil {
+		return err
+	}
+	sqe.PrepareClose(fd)
 	l.callbacks.set(sqe, cb)
 	return nil
 }
