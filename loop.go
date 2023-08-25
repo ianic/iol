@@ -1,10 +1,14 @@
 package loop
 
 import (
+	"context"
+	"log/slog"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/pawelgaczynski/giouring"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -78,7 +82,7 @@ func (b *providedBuffers) release(buf []byte, bufferID uint16) {
 	b.br.BufRingAdvance(1)
 }
 
-func NewLoop(ringSize uint32) (*Loop, error) {
+func New(ringSize uint32) (*Loop, error) {
 	ring, err := giouring.CreateRing(ringSize)
 	if err != nil {
 		return nil, err
@@ -104,6 +108,50 @@ func (l *Loop) Tick() error {
 	return nil
 }
 
+func (l *Loop) RunUntilDone() error {
+	for {
+		slog.Debug("run until done", "in-kernel", l.inKernel)
+		if l.inKernel == 0 {
+			return nil
+		}
+		l.Tick()
+	}
+}
+
+func (l *Loop) Run(ctx context.Context, timeout time.Duration) error {
+	ts := syscall.NsecToTimespec(int64(timeout))
+	done := func() bool {
+		select {
+		case <-ctx.Done():
+			return true
+		default:
+		}
+		return false
+	}
+	for {
+		submitted, err := l.ring.SubmitAndWait(0)
+		if err != nil {
+			return err
+		}
+		l.inKernel += submitted
+		if _, err := l.ring.WaitCQEs(1, &ts, nil); err != nil {
+			if errno, ok := err.(syscall.Errno); ok {
+				if errno.Temporary() || errno == unix.ETIME {
+					err = nil
+				}
+			}
+			if err != nil {
+				return err
+			}
+		}
+		_ = l.flushCompletions()
+		if done() {
+			break
+		}
+	}
+	return nil
+}
+
 func (l *Loop) flushCompletions() uint32 {
 	var cqes [batchSize]*giouring.CompletionQueueEvent
 	var noCompleted uint32 = 0
@@ -111,10 +159,17 @@ func (l *Loop) flushCompletions() uint32 {
 		peeked := l.ring.PeekBatchCQE(cqes[:])
 		l.inKernel -= uint(peeked)
 		for _, cqe := range cqes[:peeked] {
+			isMultiShot := (cqe.Flags & giouring.CQEFMore) > 0
+			if isMultiShot {
+				l.inKernel++
+			}
 			if cqe.UserData == 0 {
+				slog.Debug("ceq with userdata 0", "flags", cqe.Flags, "res", cqe.Res, "error", cqeErrno(cqe))
 				continue
 			}
-			l.getCallback(cqe)(cqe.Res, cqe.Flags, cqeErrno(cqe))
+			cb := l.getCallback(cqe, !isMultiShot)
+			cb(cqe.Res, cqe.Flags, cqeErrno(cqe))
+
 		}
 		l.ring.CQAdvance(peeked)
 		noCompleted += peeked
@@ -143,10 +198,9 @@ func (l *Loop) setCallback(sqe *giouring.SubmissionQueueEntry, cb completionCall
 	sqe.UserData = l.callbacksCounter
 }
 
-func (l *Loop) getCallback(cqe *giouring.CompletionQueueEvent) completionCallback {
+func (l *Loop) getCallback(cqe *giouring.CompletionQueueEvent, remove bool) completionCallback {
 	cb := l.callbacks[cqe.UserData]
-	isMultishot := (cqe.Flags & giouring.CQEFMore) > 0
-	if !isMultishot {
+	if remove {
 		delete(l.callbacks, cqe.UserData)
 	}
 	return cb
@@ -166,6 +220,27 @@ func (l *Loop) PrepareMultishotAccept(fd int, cb completionCallback) error {
 	return nil
 }
 
+func (l *Loop) PrepareCancelFd(fd int, cb completionCallback) error {
+	sqe, err := l.getSQE()
+	if err != nil {
+		return err
+	}
+	sqe.PrepareCancelFd(fd, 0)
+	l.setCallback(sqe, cb)
+	return nil
+}
+
+func (l *Loop) PrepareShutdown(fd int, cb completionCallback) error {
+	sqe, err := l.getSQE()
+	if err != nil {
+		return err
+	}
+	const SHUT_RDWR = 2
+	sqe.PrepareShutdown(fd, SHUT_RDWR)
+	l.setCallback(sqe, cb)
+	return nil
+}
+
 func (l *Loop) PrepareSend(fd int, buf []byte, cb completionCallback) error {
 	sqe, err := l.getSQE()
 	if err != nil {
@@ -177,8 +252,7 @@ func (l *Loop) PrepareSend(fd int, buf []byte, cb completionCallback) error {
 }
 
 // Multishot, provided buffers recv
-func (l *Loop) PrepareRecv(fd int,
-	cb completionCallback) error {
+func (l *Loop) PrepareRecv(fd int, cb completionCallback) error {
 	sqe, err := l.getSQE()
 	if err != nil {
 		return err

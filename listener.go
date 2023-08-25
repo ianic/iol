@@ -21,13 +21,18 @@ type Server interface {
 }
 
 type Listener struct {
-	loop *Loop
-	fd   int
-	srv  Server
+	loop  *Loop
+	fd    int
+	srv   Server
+	conns map[int]struct{}
 }
 
 func NewListener(loop *Loop, port int, srv Server) (*Listener, error) {
-	l := &Listener{loop: loop, srv: srv}
+	l := &Listener{
+		loop:  loop,
+		srv:   srv,
+		conns: make(map[int]struct{}),
+	}
 	if err := l.bind(port); err != nil {
 		return nil, err
 	}
@@ -64,11 +69,6 @@ func (l *Listener) Send(fd int, data []byte) error {
 	return l.loop.PrepareSend(fd, data, cb)
 }
 
-func (l *Listener) Close() error {
-	// TODO clean close, close connections, wait ...
-	return syscall.Close(l.fd)
-}
-
 func (l *Listener) bind(port int) error {
 	addr := syscall.SockaddrInet4{Port: port}
 	fd, err := bind(&addr)
@@ -83,6 +83,25 @@ func (l *Listener) accept() error {
 	return l.loop.PrepareMultishotAccept(l.fd, func(res int32, flags uint32, errno syscall.Errno) {
 		if errno == 0 {
 			l.onAccept(int(res))
+		} else {
+			slog.Debug("accept", "errno", errno, "res", res, "flags", flags)
+		}
+	})
+}
+
+// func (l *Listener) Close() error {
+// 	// TODO clean close, close connections, wait ...
+// 	return syscall.Close(l.fd)
+// }
+
+func (l *Listener) Close() error {
+	return l.loop.PrepareCancelFd(l.fd, func(res int32, flags uint32, errno syscall.Errno) {
+		slog.Debug("listener close", "errno", errno, "res", res, "flags", flags)
+		for fd := range l.conns {
+			l.loop.PrepareShutdown(fd, func(res int32, flags uint32, errno syscall.Errno) {
+				slog.Debug("shutdown", "fd", fd, "errno", errno, "res", res, "flags", flags)
+				delete(l.conns, fd)
+			})
 		}
 	})
 }
@@ -95,6 +114,8 @@ func (l *Listener) onAccept(fd int) {
 // recvLoop starts multishot recv on fd
 // Will receive on fd until error occures.
 func (l *Listener) recvLoop(fd int) error {
+	l.conns[fd] = struct{}{}
+
 	var cb completionCallback
 	cb = func(res int32, flags uint32, errno syscall.Errno) {
 		if errno > 0 {

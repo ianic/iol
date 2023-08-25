@@ -1,9 +1,13 @@
 package main
 
 import (
-	"log"
+	"context"
 	"log/slog"
 	"loop"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 )
 
 func main() {
@@ -15,7 +19,7 @@ func main() {
 	// 			AddSource: true,
 	// 		})))
 	if err := run(4242); err != nil {
-		log.Panic(err)
+		slog.Error("run", "error", err)
 	}
 
 }
@@ -24,21 +28,44 @@ const ringSize = 32
 
 func run(port int) error {
 	slog.Debug("starting server", "port", port)
-	lp, err := loop.NewLoop(ringSize)
+	lp, err := loop.New(ringSize)
 	if err != nil {
 		return err
 	}
 	defer lp.Close()
 	srv := server{}
-	l, err := loop.NewListener(lp, port, &srv)
+	ln, err := loop.NewListener(lp, port, &srv)
 	if err != nil {
 		return err
 	}
-	defer l.Close()
-	for {
-		lp.Tick()
+
+	ctx := interuptContext()
+	if err := lp.Run(ctx, time.Second); err != nil {
+		slog.Error("run", "error", err)
 	}
+	ln.Close()
+	if err := lp.RunUntilDone(); err != nil {
+		slog.Error("run", "error", err)
+	}
+
 	return nil
+}
+
+func waitForInterupt() {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	slog.Debug("interrupt")
+}
+
+// interuptContext returns context which will be closed on application interupt
+func interuptContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		waitForInterupt()
+		cancel()
+	}()
+	return ctx
 }
 
 type server struct {
