@@ -24,11 +24,9 @@ func main() {
 
 }
 
-const ringSize = 32
-
 func run(port int) error {
 	slog.Debug("starting server", "port", port)
-	lp, err := loop.New(ringSize)
+	lp, err := loop.New(loop.DefaultOptions)
 	if err != nil {
 		return err
 	}
