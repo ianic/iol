@@ -34,8 +34,8 @@ type Options struct {
 
 var DefaultOptions = Options{
 	RingEntries:      1024,
-	RecvBuffersCount: 16,
-	RecvBufferLen:    64 * 1024,
+	RecvBuffersCount: 256,
+	RecvBufferLen:    4 * 1024,
 }
 
 func New(opt Options) (*Loop, error) {

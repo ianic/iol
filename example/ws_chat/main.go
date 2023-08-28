@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"log/slog"
 	"time"
 
@@ -9,26 +10,15 @@ import (
 )
 
 func main() {
-	// slog.SetDefault(slog.New(
-	// 	slog.NewTextHandler(
-	// 		os.Stderr,
-	// 		&slog.HandlerOptions{
-	// 			Level:     slog.LevelDebug,
-	// 			AddSource: true,
-	// 		})))
-	if err := run(4242); err != nil {
-		slog.Error("run", "error", err)
+	if err := run(4243); err != nil {
+		log.Panic(err)
 	}
 
 }
 
 func run(port int) error {
 	slog.Debug("starting server", "port", port)
-	lp, err := iol.New(iol.Options{
-		RingEntries:      128,
-		RecvBuffersCount: 256,
-		RecvBufferLen:    1024,
-	})
+	lp, err := iol.New(iol.DefaultOptions)
 	if err != nil {
 		return err
 	}

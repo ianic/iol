@@ -29,10 +29,6 @@ func main() {
 			<-ch
 		}()
 	}
-
-	if err := echoTest(buf); err != nil {
-		log.Fatal(err)
-	}
 }
 
 func randomBuf(size int) ([]byte, error) {
